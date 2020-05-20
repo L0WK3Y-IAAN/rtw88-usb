@@ -2,6 +2,8 @@
 /* Copyright(c) 2018-2019  Realtek Corporation
  */
 
+#include <linux/iopoll.h>
+
 #include "main.h"
 #include "coex.h"
 #include "fw.h"
@@ -11,76 +13,6 @@
 #include "debug.h"
 #include "util.h"
 #include "wow.h"
-
-#define C2H_DBG_CONTENT_MAX_LENGTH	228
-#define C2H_DBG_HDR_LEN			4
-
-struct rtw_c2h_cmd_ext {
-	u8 cmdid;
-	u8 cmdseq;
-	u8 subid;
-	u8 cmdlen;
-	u8 payload[0];
-};
-
-static void rtw_fw_dbg_cmd_handle(struct rtw_dev *rtwdev,
-				  struct sk_buff *skb)
-{
-	struct rtw_c2h_cmd_ext *buf;
-	int i;
-	u8 cur_msg = 0;
-	u8 next_msg = 0;
-	u8 msg_len = 0;
-	char *c2h_buf;
-	u8 len;
-
-	buf = (struct rtw_c2h_cmd_ext *)get_c2h_from_skb(skb);
-	len = buf->cmdlen;
-
-	if (len > C2H_DBG_CONTENT_MAX_LENGTH) {
-		pr_err("[ERR]c2h size > max len!\n");
-		return;
-	}
-
-	for (i = 0; i < len; i++) {
-		if (buf->payload[i] == '\n') {
-			if (buf->payload[i + 1] == '\0' ||
-			    buf->payload[i + 1] == 0xFF) {
-				msg_len = i + 1;
-				break;
-			}
-		}
-	}
-
-	c2h_buf = kmalloc(msg_len, GFP_KERNEL);
-	if (!c2h_buf)
-		return;
-
-	memcpy(c2h_buf, buf->payload, msg_len);
-	c2h_buf[msg_len - 1] = '\0';
-	pr_info("[RTKFW, SEQ=%d]: %s", c2h_buf[0], (char *)(&c2h_buf[1]));
-	kfree(c2h_buf);
-
-	next_msg = msg_len + C2H_DBG_HDR_LEN;
-
-	while (*((u8 *)(buf) + next_msg) != '\0') {
-		cur_msg = next_msg;
-
-		msg_len = (u8)(*((u8 *)(buf) + cur_msg + 3)) - 1;
-		next_msg += C2H_DBG_HDR_LEN + msg_len;
-
-		c2h_buf = kmalloc(msg_len, GFP_KERNEL);
-		if (!c2h_buf)
-			return;
-
-		memcpy(c2h_buf, (u8 *)(buf) + cur_msg + C2H_DBG_HDR_LEN,
-		       msg_len);
-		*(c2h_buf + msg_len - 1) = '\0';
-		pr_info("[RTKFW, SEQ=%d]: %s", c2h_buf[0],
-			(char *)(&c2h_buf[1]));
-		kfree(c2h_buf);
-	}
-}
 
 static void rtw_fw_c2h_cmd_handle_ext(struct rtw_dev *rtwdev,
 				      struct sk_buff *skb)
@@ -92,11 +24,8 @@ static void rtw_fw_c2h_cmd_handle_ext(struct rtw_dev *rtwdev,
 	sub_cmd_id = c2h->payload[0];
 
 	switch (sub_cmd_id) {
-	case C2H_DEBUG_RPT:
-		rtw_fw_dbg_cmd_handle(rtwdev, skb);
-		break;
 	case C2H_CCX_RPT:
-		rtw_tx_report_handle(rtwdev, skb);
+		rtw_tx_report_handle(rtwdev, skb, C2H_CCX_RPT);
 		break;
 	default:
 		break;
@@ -207,14 +136,15 @@ void rtw_fw_c2h_cmd_handle(struct rtw_dev *rtwdev, struct sk_buff *skb)
 	c2h = (struct rtw_c2h_cmd *)(skb->data + pkt_offset);
 	len = skb->len - pkt_offset - 2;
 
-	//pr_info("%s: id=%d, seq=%d\n", __func__, c2h->id, c2h->seq);
-
 	mutex_lock(&rtwdev->mutex);
 
 	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags))
 		goto unlock;
 
 	switch (c2h->id) {
+	case C2H_CCX_TX_RPT:
+		rtw_tx_report_handle(rtwdev, skb, C2H_CCX_TX_RPT);
+		break;
 	case C2H_BT_INFO:
 		rtw_coex_bt_info_notify(rtwdev, c2h->payload, len);
 		break;
@@ -228,13 +158,13 @@ void rtw_fw_c2h_cmd_handle(struct rtw_dev *rtwdev, struct sk_buff *skb)
 		rtw_fw_ra_report_handle(rtwdev, c2h->payload, len);
 		break;
 	default:
+		rtw_dbg(rtwdev, RTW_DBG_FW, "C2H 0x%x isn't handled\n", c2h->id);
 		break;
 	}
 
 unlock:
 	mutex_unlock(&rtwdev->mutex);
 }
-EXPORT_SYMBOL(rtw_fw_c2h_cmd_handle);
 
 void rtw_fw_c2h_cmd_rx_irqsafe(struct rtw_dev *rtwdev, u32 pkt_offset,
 			       struct sk_buff *skb)
@@ -263,36 +193,21 @@ void rtw_fw_c2h_cmd_rx_irqsafe(struct rtw_dev *rtwdev, u32 pkt_offset,
 }
 EXPORT_SYMBOL(rtw_fw_c2h_cmd_rx_irqsafe);
 
-struct rtw_h2c_cmd {
-	__le32 msg;
-	__le32 msg_ext;
-} __packed;
-
 static void rtw_fw_send_h2c_command(struct rtw_dev *rtwdev,
 				    u8 *h2c)
 {
-	struct rtw_h2c_cmd *h2c_box = (struct rtw_h2c_cmd *)h2c;
+	struct rtw_h2c_cmd *h2c_cmd = (struct rtw_h2c_cmd *)h2c;
 	u8 box;
 	u8 box_state;
 	u32 box_reg, box_ex_reg;
-	u32 h2c_wait;
+	int ret;
 
-	//static u16 pre_seq = 0;
-	//u16 seq;
-
-	//pr_info("send H2C content %02x%02x%02x%02x %02x%02x%02x%02x\n",
-	//	h2c[3], h2c[2], h2c[1], h2c[0],
-	//	h2c[7], h2c[6], h2c[5], h2c[4]);
-
-	// before sending H2C
-	//do {
-	//seq = rtw_read32(rtwdev, 0x1c8);
-	//pr_info("%s: seq=%x, pre_seq=%x\n", __func__, seq, pre_seq);
-	//} while (seq == pre_seq);
+	rtw_dbg(rtwdev, RTW_DBG_FW,
+		"send H2C content %02x%02x%02x%02x %02x%02x%02x%02x\n",
+		h2c[3], h2c[2], h2c[1], h2c[0],
+		h2c[7], h2c[6], h2c[5], h2c[4]);
 
 	mutex_lock(&rtwdev->h2c.lock);
-
-	//pre_seq = seq;
 
 	box = rtwdev->h2c.last_box_num;
 	switch (box) {
@@ -317,18 +232,17 @@ static void rtw_fw_send_h2c_command(struct rtw_dev *rtwdev,
 		goto out;
 	}
 
-	h2c_wait = 20;
-	do {
-		box_state = rtw_read8(rtwdev, REG_HMETFR);
-	} while ((box_state >> box) & 0x1 && --h2c_wait > 0);
+	ret = read_poll_timeout_atomic(rtw_read8, box_state,
+				       !((box_state >> box) & 0x1), 100, 3000,
+				       false, rtwdev, REG_HMETFR);
 
-	if (!h2c_wait) {
+	if (ret) {
 		rtw_err(rtwdev, "failed to send h2c command\n");
 		goto out;
 	}
 
-	rtw_write32(rtwdev, box_ex_reg, le32_to_cpu(h2c_box->msg_ext));
-	rtw_write32(rtwdev, box_reg, le32_to_cpu(h2c_box->msg));
+	rtw_write32(rtwdev, box_ex_reg, le32_to_cpu(h2c_cmd->msg_ext));
+	rtw_write32(rtwdev, box_reg, le32_to_cpu(h2c_cmd->msg));
 
 	if (++rtwdev->h2c.last_box_num >= 4)
 		rtwdev->h2c.last_box_num = 0;
@@ -359,6 +273,9 @@ rtw_fw_send_general_info(struct rtw_dev *rtwdev)
 	u8 h2c_pkt[H2C_PKT_SIZE] = {0};
 	u16 total_size = H2C_PKT_HDR_SIZE + 4;
 
+	if (rtw_chip_wcpu_11n(rtwdev))
+		return;
+
 	rtw_h2c_pkt_set_header(h2c_pkt, H2C_PKT_GENERAL_INFO);
 
 	SET_PKT_H2C_TOTAL_LEN(h2c_pkt, total_size);
@@ -378,6 +295,9 @@ rtw_fw_send_phydm_info(struct rtw_dev *rtwdev)
 	u8 h2c_pkt[H2C_PKT_SIZE] = {0};
 	u16 total_size = H2C_PKT_HDR_SIZE + 8;
 	u8 fw_rf_type = 0;
+
+	if (rtw_chip_wcpu_11n(rtwdev))
+		return;
 
 	if (hal->rf_type == RF_1T1R)
 		fw_rf_type = FW_RF_1T1R;
@@ -408,6 +328,7 @@ void rtw_fw_do_iqk(struct rtw_dev *rtwdev, struct rtw_iqk_para *para)
 
 	rtw_fw_send_h2c_packet(rtwdev, h2c_pkt);
 }
+EXPORT_SYMBOL(rtw_fw_do_iqk);
 
 void rtw_fw_query_bt_info(struct rtw_dev *rtwdev)
 {
@@ -672,7 +593,7 @@ static u8 rtw_get_rsvd_page_location(struct rtw_dev *rtwdev,
 	struct rtw_rsvd_page *rsvd_pkt;
 	u8 location = 0;
 
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
 		if (type == rsvd_pkt->type)
 			location = rsvd_pkt->page;
 	}
@@ -725,7 +646,7 @@ static u8 rtw_get_rsvd_page_probe_req_location(struct rtw_dev *rtwdev,
 	struct rtw_rsvd_page *rsvd_pkt;
 	u8 location = 0;
 
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
 		if (rsvd_pkt->type != RSVD_PROBE_REQ)
 			continue;
 		if ((!ssid && !rsvd_pkt->ssid) ||
@@ -742,7 +663,7 @@ static u16 rtw_get_rsvd_page_probe_req_size(struct rtw_dev *rtwdev,
 	struct rtw_rsvd_page *rsvd_pkt;
 	u16 size = 0;
 
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
 		if (rsvd_pkt->type != RSVD_PROBE_REQ)
 			continue;
 		if ((!ssid && !rsvd_pkt->ssid) ||
@@ -777,25 +698,6 @@ void rtw_send_rsvd_page_h2c(struct rtw_dev *rtwdev)
 	rtw_dbg(rtwdev, RTW_DBG_FW, "RSVD_QOS_NULL loc: %d\n", location);
 
 	rtw_fw_send_h2c_command(rtwdev, h2c_pkt);
-}
-
-static struct sk_buff *
-rtw_beacon_get(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
-{
-	struct sk_buff *skb_new;
-
-	if (vif->type != NL80211_IFTYPE_AP &&
-	    vif->type != NL80211_IFTYPE_ADHOC &&
-	    !ieee80211_vif_is_mesh(vif)) {
-		skb_new = alloc_skb(1, GFP_KERNEL);
-		if (!skb_new)
-			return NULL;
-		skb_put(skb_new, 1);
-	} else {
-		skb_new = ieee80211_beacon_get(hw, vif);
-	}
-
-	return skb_new;
 }
 
 static struct sk_buff *rtw_nlo_info_get(struct ieee80211_hw *hw)
@@ -930,8 +832,7 @@ static struct sk_buff *rtw_lps_pg_info_get(struct ieee80211_hw *hw)
 	skb_reserve(skb, chip->tx_pkt_desc_sz);
 	pg_info_hdr = skb_put_zero(skb, sizeof(*pg_info_hdr));
 	pg_info_hdr->tx_bu_page_count = rtwdev->fifo.rsvd_drv_pg_num;
-	pg_info_hdr->macid = find_first_bit(rtwdev->mac_id_map,
-					    RTW_MAX_MAC_ID_NUM);
+	pg_info_hdr->macid = find_first_bit(rtwdev->mac_id_map, RTW_MAX_MAC_ID_NUM);
 	pg_info_hdr->sec_cam_count =
 		rtw_sec_cam_pg_backup(rtwdev, pg_info_hdr->sec_cam);
 	pg_info_hdr->pattern_count = rtw_wow->pattern_cnt;
@@ -943,15 +844,31 @@ static struct sk_buff *rtw_lps_pg_info_get(struct ieee80211_hw *hw)
 }
 
 static struct sk_buff *rtw_get_rsvd_page_skb(struct ieee80211_hw *hw,
-					     struct ieee80211_vif *vif,
 					     struct rtw_rsvd_page *rsvd_pkt)
 {
+	struct ieee80211_vif *vif;
+	struct rtw_vif *rtwvif;
 	struct sk_buff *skb_new;
 	struct cfg80211_ssid *ssid;
 
+	if (rsvd_pkt->type == RSVD_DUMMY) {
+		skb_new = alloc_skb(1, GFP_KERNEL);
+		if (!skb_new)
+			return NULL;
+
+		skb_put(skb_new, 1);
+		return skb_new;
+	}
+
+	rtwvif = rsvd_pkt->rtwvif;
+	if (!rtwvif)
+		return NULL;
+
+	vif = rtwvif_to_vif(rtwvif);
+
 	switch (rsvd_pkt->type) {
 	case RSVD_BEACON:
-		skb_new = rtw_beacon_get(hw, vif);
+		skb_new = ieee80211_beacon_get(hw, vif);
 		break;
 	case RSVD_PS_POLL:
 		skb_new = ieee80211_pspoll_get(hw, vif);
@@ -978,8 +895,7 @@ static struct sk_buff *rtw_get_rsvd_page_skb(struct ieee80211_hw *hw,
 							 ssid->ssid,
 							 ssid->ssid_len, 0);
 		else
-			skb_new = ieee80211_probereq_get(hw, vif->addr, NULL,
-							 0, 0);
+			skb_new = ieee80211_probereq_get(hw, vif->addr, NULL, 0, 0);
 		break;
 	case RSVD_NLO_INFO:
 		skb_new = rtw_nlo_info_get(hw);
@@ -997,14 +913,14 @@ static struct sk_buff *rtw_get_rsvd_page_skb(struct ieee80211_hw *hw,
 	return skb_new;
 }
 
-static void rtw_fill_rsvd_page_desc(struct rtw_dev *rtwdev, struct sk_buff *skb)
+static void rtw_fill_rsvd_page_desc(struct rtw_dev *rtwdev, struct sk_buff *skb,
+				    enum rtw_rsvd_packet_type type)
 {
-	struct rtw_tx_pkt_info pkt_info;
+	struct rtw_tx_pkt_info pkt_info = {0};
 	struct rtw_chip_info *chip = rtwdev->chip;
 	u8 *pkt_desc;
 
-	memset(&pkt_info, 0, sizeof(pkt_info));
-	rtw_rsvd_page_pkt_info_update(rtwdev, &pkt_info, skb);
+	rtw_tx_rsvd_page_pkt_info_update(rtwdev, &pkt_info, skb, type);
 	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
 	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
 	rtw_tx_fill_tx_desc(&pkt_info, skb);
@@ -1039,6 +955,8 @@ static struct rtw_rsvd_page *rtw_alloc_rsvd_page(struct rtw_dev *rtwdev,
 	if (!rsvd_pkt)
 		return NULL;
 
+	INIT_LIST_HEAD(&rsvd_pkt->vif_list);
+	INIT_LIST_HEAD(&rsvd_pkt->build_list);
 	rsvd_pkt->type = type;
 	rsvd_pkt->add_txdesc = txdesc;
 
@@ -1046,49 +964,122 @@ static struct rtw_rsvd_page *rtw_alloc_rsvd_page(struct rtw_dev *rtwdev,
 }
 
 static void rtw_insert_rsvd_page(struct rtw_dev *rtwdev,
+				 struct rtw_vif *rtwvif,
 				 struct rtw_rsvd_page *rsvd_pkt)
 {
 	lockdep_assert_held(&rtwdev->mutex);
-	list_add_tail(&rsvd_pkt->list, &rtwdev->rsvd_page_list);
+
+	list_add_tail(&rsvd_pkt->vif_list, &rtwvif->rsvd_page_list);
 }
 
-void rtw_add_rsvd_page(struct rtw_dev *rtwdev, enum rtw_rsvd_packet_type type,
-		       bool txdesc)
+static void rtw_add_rsvd_page(struct rtw_dev *rtwdev,
+			      struct rtw_vif *rtwvif,
+			      enum rtw_rsvd_packet_type type,
+			      bool txdesc)
 {
 	struct rtw_rsvd_page *rsvd_pkt;
 
 	rsvd_pkt = rtw_alloc_rsvd_page(rtwdev, type, txdesc);
-	if (!rsvd_pkt)
+	if (!rsvd_pkt) {
+		rtw_err(rtwdev, "failed to alloc rsvd page %d\n", type);
 		return;
+	}
 
-	rtw_insert_rsvd_page(rtwdev, rsvd_pkt);
+	rsvd_pkt->rtwvif = rtwvif;
+	rtw_insert_rsvd_page(rtwdev, rtwvif, rsvd_pkt);
 }
 
-void rtw_add_rsvd_page_probe_req(struct rtw_dev *rtwdev,
-				 struct cfg80211_ssid *ssid)
+static void rtw_add_rsvd_page_probe_req(struct rtw_dev *rtwdev,
+					struct rtw_vif *rtwvif,
+					struct cfg80211_ssid *ssid)
 {
 	struct rtw_rsvd_page *rsvd_pkt;
 
 	rsvd_pkt = rtw_alloc_rsvd_page(rtwdev, RSVD_PROBE_REQ, true);
-	if (!rsvd_pkt)
+	if (!rsvd_pkt) {
+		rtw_err(rtwdev, "failed to alloc probe req rsvd page\n");
 		return;
+	}
 
+	rsvd_pkt->rtwvif = rtwvif;
 	rsvd_pkt->ssid = ssid;
-	rtw_insert_rsvd_page(rtwdev, rsvd_pkt);
+	rtw_insert_rsvd_page(rtwdev, rtwvif, rsvd_pkt);
 }
 
-void rtw_reset_rsvd_page(struct rtw_dev *rtwdev)
+void rtw_remove_rsvd_page(struct rtw_dev *rtwdev,
+			  struct rtw_vif *rtwvif)
 {
 	struct rtw_rsvd_page *rsvd_pkt, *tmp;
 
 	lockdep_assert_held(&rtwdev->mutex);
 
-	list_for_each_entry_safe(rsvd_pkt, tmp, &rtwdev->rsvd_page_list, list) {
-		if (rsvd_pkt->type == RSVD_BEACON)
-			continue;
-		list_del(&rsvd_pkt->list);
+	/* remove all of the rsvd pages for vif */
+	list_for_each_entry_safe(rsvd_pkt, tmp, &rtwvif->rsvd_page_list,
+				 vif_list) {
+		list_del(&rsvd_pkt->vif_list);
+		if (!list_empty(&rsvd_pkt->build_list))
+			list_del(&rsvd_pkt->build_list);
 		kfree(rsvd_pkt);
 	}
+}
+
+void rtw_add_rsvd_page_bcn(struct rtw_dev *rtwdev,
+			   struct rtw_vif *rtwvif)
+{
+	struct ieee80211_vif *vif = rtwvif_to_vif(rtwvif);
+
+	if (vif->type != NL80211_IFTYPE_AP &&
+	    vif->type != NL80211_IFTYPE_ADHOC &&
+	    vif->type != NL80211_IFTYPE_MESH_POINT) {
+		rtw_warn(rtwdev, "Cannot add beacon rsvd page for %d\n",
+			 vif->type);
+		return;
+	}
+
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_BEACON, false);
+}
+
+void rtw_add_rsvd_page_pno(struct rtw_dev *rtwdev,
+			   struct rtw_vif *rtwvif)
+{
+	struct ieee80211_vif *vif = rtwvif_to_vif(rtwvif);
+	struct rtw_wow_param *rtw_wow = &rtwdev->wow;
+	struct rtw_pno_request *rtw_pno_req = &rtw_wow->pno_req;
+	struct cfg80211_ssid *ssid;
+	int i;
+
+	if (vif->type != NL80211_IFTYPE_STATION) {
+		rtw_warn(rtwdev, "Cannot add PNO rsvd page for %d\n",
+			 vif->type);
+		return;
+	}
+
+	for (i = 0 ; i < rtw_pno_req->match_set_cnt; i++) {
+		ssid = &rtw_pno_req->match_sets[i].ssid;
+		rtw_add_rsvd_page_probe_req(rtwdev, rtwvif, ssid);
+	}
+
+	rtw_add_rsvd_page_probe_req(rtwdev, rtwvif, NULL);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_NLO_INFO, false);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_CH_INFO, true);
+}
+
+void rtw_add_rsvd_page_sta(struct rtw_dev *rtwdev,
+			   struct rtw_vif *rtwvif)
+{
+	struct ieee80211_vif *vif = rtwvif_to_vif(rtwvif);
+
+	if (vif->type != NL80211_IFTYPE_STATION) {
+		rtw_warn(rtwdev, "Cannot add sta rsvd page for %d\n",
+			 vif->type);
+		return;
+	}
+
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_PS_POLL, true);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_QOS_NULL, true);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_NULL, true);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_LPS_PG_DPK, true);
+	rtw_add_rsvd_page(rtwdev, rtwvif, RSVD_LPS_PG_INFO, true);
 }
 
 int rtw_fw_write_data_rsvd_page(struct rtw_dev *rtwdev, u16 pg_addr,
@@ -1097,6 +1088,8 @@ int rtw_fw_write_data_rsvd_page(struct rtw_dev *rtwdev, u16 pg_addr,
 	u8 bckp[2];
 	u8 val;
 	u16 rsvd_pg_head;
+	u32 bcn_valid_addr;
+	u32 bcn_valid_mask;
 	int ret;
 
 	lockdep_assert_held(&rtwdev->mutex);
@@ -1104,8 +1097,13 @@ int rtw_fw_write_data_rsvd_page(struct rtw_dev *rtwdev, u16 pg_addr,
 	if (!size)
 		return -EINVAL;
 
-	pg_addr &= BIT_MASK_BCN_HEAD_1_V1;
-	rtw_write16(rtwdev, REG_FIFOPAGE_CTRL_2, pg_addr | BIT_BCN_VALID_V1);
+	if (rtw_chip_wcpu_11n(rtwdev)) {
+		rtw_write32_set(rtwdev, REG_DWBCN0_CTRL, BIT_BCN_VALID);
+	} else {
+		pg_addr &= BIT_MASK_BCN_HEAD_1_V1;
+		pg_addr |= BIT_BCN_VALID_V1;
+		rtw_write16(rtwdev, REG_FIFOPAGE_CTRL_2, pg_addr);
+	}
 
 	val = rtw_read8(rtwdev, REG_CR + 1);
 	bckp[0] = val;
@@ -1123,7 +1121,15 @@ int rtw_fw_write_data_rsvd_page(struct rtw_dev *rtwdev, u16 pg_addr,
 		goto restore;
 	}
 
-	if (!check_hw_ready(rtwdev, REG_FIFOPAGE_CTRL_2, BIT_BCN_VALID_V1, 1)) {
+	if (rtw_chip_wcpu_11n(rtwdev)) {
+		bcn_valid_addr = REG_DWBCN0_CTRL;
+		bcn_valid_mask = BIT_BCN_VALID;
+	} else {
+		bcn_valid_addr = REG_FIFOPAGE_CTRL_2;
+		bcn_valid_mask = BIT_BCN_VALID_V1;
+	}
+
+	if (!check_hw_ready(rtwdev, bcn_valid_addr, bcn_valid_mask, 1)) {
 		rtw_err(rtwdev, "error beacon valid\n");
 		ret = -EBUSY;
 	}
@@ -1154,8 +1160,72 @@ static int rtw_download_drv_rsvd_page(struct rtw_dev *rtwdev, u8 *buf, u32 size)
 	return rtw_fw_write_data_rsvd_page(rtwdev, pg_addr, buf, size);
 }
 
-static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
-			       struct ieee80211_vif *vif, u32 *size)
+static void __rtw_build_rsvd_page_reset(struct rtw_dev *rtwdev)
+{
+	struct rtw_rsvd_page *rsvd_pkt, *tmp;
+
+	list_for_each_entry_safe(rsvd_pkt, tmp, &rtwdev->rsvd_page_list,
+				 build_list) {
+		list_del_init(&rsvd_pkt->build_list);
+
+		/* Don't free except for the dummy rsvd page,
+		 * others will be freed when removing vif
+		 */
+		if (rsvd_pkt->type == RSVD_DUMMY)
+			kfree(rsvd_pkt);
+	}
+}
+
+static void rtw_build_rsvd_page_iter(void *data, u8 *mac,
+				     struct ieee80211_vif *vif)
+{
+	struct rtw_dev *rtwdev = data;
+	struct rtw_vif *rtwvif = (struct rtw_vif *)vif->drv_priv;
+	struct rtw_rsvd_page *rsvd_pkt;
+
+	list_for_each_entry(rsvd_pkt, &rtwvif->rsvd_page_list, vif_list) {
+		if (rsvd_pkt->type == RSVD_BEACON)
+			list_add(&rsvd_pkt->build_list,
+				 &rtwdev->rsvd_page_list);
+		else
+			list_add_tail(&rsvd_pkt->build_list,
+				      &rtwdev->rsvd_page_list);
+	}
+}
+
+static int  __rtw_build_rsvd_page_from_vifs(struct rtw_dev *rtwdev)
+{
+	struct rtw_rsvd_page *rsvd_pkt;
+
+	__rtw_build_rsvd_page_reset(rtwdev);
+
+	/* gather rsvd page from vifs */
+	rtw_iterate_vifs_atomic(rtwdev, rtw_build_rsvd_page_iter, rtwdev);
+
+	rsvd_pkt = list_first_entry_or_null(&rtwdev->rsvd_page_list,
+					    struct rtw_rsvd_page, build_list);
+	if (!rsvd_pkt) {
+		WARN(1, "Should not have an empty reserved page\n");
+		return -EINVAL;
+	}
+
+	/* the first rsvd should be beacon, otherwise add a dummy one */
+	if (rsvd_pkt->type != RSVD_BEACON) {
+		struct rtw_rsvd_page *dummy_pkt;
+
+		dummy_pkt = rtw_alloc_rsvd_page(rtwdev, RSVD_DUMMY, false);
+		if (!dummy_pkt) {
+			rtw_err(rtwdev, "failed to alloc dummy rsvd page\n");
+			return -ENOMEM;
+		}
+
+		list_add(&dummy_pkt->build_list, &rtwdev->rsvd_page_list);
+	}
+
+	return 0;
+}
+
+static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev, u32 *size)
 {
 	struct ieee80211_hw *hw = rtwdev->hw;
 	struct rtw_chip_info *chip = rtwdev->chip;
@@ -1165,13 +1235,21 @@ static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
 	u8 total_page = 0;
 	u8 page_size, page_margin, tx_desc_sz;
 	u8 *buf;
+	int ret;
 
 	page_size = chip->page_size;
 	tx_desc_sz = chip->tx_pkt_desc_sz;
 	page_margin = page_size - tx_desc_sz;
 
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
-		iter = rtw_get_rsvd_page_skb(hw, vif, rsvd_pkt);
+	ret = __rtw_build_rsvd_page_from_vifs(rtwdev);
+	if (ret) {
+		rtw_err(rtwdev,
+			"failed to build rsvd page from vifs, ret %d\n", ret);
+		return NULL;
+	}
+
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
+		iter = rtw_get_rsvd_page_skb(hw, rsvd_pkt);
 		if (!iter) {
 			rtw_err(rtwdev, "failed to build rsvd packet\n");
 			goto release_skb;
@@ -1181,7 +1259,7 @@ static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
 		 * And iter->len will be added with size of tx_desc_sz.
 		 */
 		if (rsvd_pkt->add_txdesc)
-			rtw_fill_rsvd_page_desc(rtwdev, iter);
+			rtw_fill_rsvd_page_desc(rtwdev, iter, rsvd_pkt->type);
 
 		rsvd_pkt->skb = iter;
 		rsvd_pkt->page = total_page;
@@ -1195,7 +1273,8 @@ static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
 		 * is smaller than the actual size of the whole rsvd_page
 		 */
 		if (total_page == 0) {
-			if (rsvd_pkt->type != RSVD_BEACON) {
+			if (rsvd_pkt->type != RSVD_BEACON &&
+			    rsvd_pkt->type != RSVD_DUMMY) {
 				rtw_err(rtwdev, "first page should be a beacon\n");
 				goto release_skb;
 			}
@@ -1223,7 +1302,7 @@ static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
 	 * And that rsvd_pkt does not require tx_desc because when it goes
 	 * through TX path, the TX path will generate one for it.
 	 */
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
 		rtw_rsvd_page_list_to_buf(rtwdev, page_size, page_margin,
 					  page, buf, rsvd_pkt);
 		if (page == 0)
@@ -1239,7 +1318,7 @@ static u8 *rtw_build_rsvd_page(struct rtw_dev *rtwdev,
 	return buf;
 
 release_skb:
-	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, list) {
+	list_for_each_entry(rsvd_pkt, &rtwdev->rsvd_page_list, build_list) {
 		kfree_skb(rsvd_pkt->skb);
 		rsvd_pkt->skb = NULL;
 	}
@@ -1247,18 +1326,31 @@ release_skb:
 	return NULL;
 }
 
-static int
-rtw_download_beacon(struct rtw_dev *rtwdev, struct ieee80211_vif *vif)
+static int rtw_download_beacon(struct rtw_dev *rtwdev)
 {
 	struct ieee80211_hw *hw = rtwdev->hw;
+	struct rtw_rsvd_page *rsvd_pkt;
 	struct sk_buff *skb;
 	int ret = 0;
 
-	skb = rtw_beacon_get(hw, vif);
+	rsvd_pkt = list_first_entry_or_null(&rtwdev->rsvd_page_list,
+					    struct rtw_rsvd_page, build_list);
+	if (!rsvd_pkt) {
+		rtw_err(rtwdev, "failed to get rsvd page from build list\n");
+		return -ENOENT;
+	}
+
+	if (rsvd_pkt->type != RSVD_BEACON &&
+	    rsvd_pkt->type != RSVD_DUMMY) {
+		rtw_err(rtwdev, "invalid rsvd page type %d, should be beacon or dummy\n",
+			rsvd_pkt->type);
+		return -EINVAL;
+	}
+
+	skb = rtw_get_rsvd_page_skb(hw, rsvd_pkt);
 	if (!skb) {
 		rtw_err(rtwdev, "failed to get beacon skb\n");
-		ret = -ENOMEM;
-		goto out;
+		return -ENOMEM;
 	}
 
 	ret = rtw_download_drv_rsvd_page(rtwdev, skb->data, skb->len);
@@ -1267,17 +1359,16 @@ rtw_download_beacon(struct rtw_dev *rtwdev, struct ieee80211_vif *vif)
 
 	dev_kfree_skb(skb);
 
-out:
 	return ret;
 }
 
-int rtw_fw_download_rsvd_page(struct rtw_dev *rtwdev, struct ieee80211_vif *vif)
+int rtw_fw_download_rsvd_page(struct rtw_dev *rtwdev)
 {
 	u8 *buf;
 	u32 size;
 	int ret;
 
-	buf = rtw_build_rsvd_page(rtwdev, vif, &size);
+	buf = rtw_build_rsvd_page(rtwdev, &size);
 	if (!buf) {
 		rtw_err(rtwdev, "failed to build rsvd page pkt\n");
 		return -ENOMEM;
@@ -1294,7 +1385,7 @@ int rtw_fw_download_rsvd_page(struct rtw_dev *rtwdev, struct ieee80211_vif *vif)
 	 * the beacon again to replace the TX desc header, and we will get
 	 * a correct tx_desc for the beacon in the rsvd page.
 	 */
-	ret = rtw_download_beacon(rtwdev, vif);
+	ret = rtw_download_beacon(rtwdev);
 	if (ret) {
 		rtw_err(rtwdev, "failed to download beacon\n");
 		goto free;
