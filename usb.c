@@ -16,8 +16,20 @@
 
 #define USB_MSG_TIMEOUT	3000 /* (ms) */
 
-static inline void rtw_usb_fill_tx_checksum(struct rtw_usb *rtwusb,
-					    struct sk_buff *skb, int agg_num)
+/* RTW queue / pipe functions */
+static u8 rtw_usb_ac_to_hwq[] = {
+	[IEEE80211_AC_VO] = RTW_TX_QUEUE_VO,
+	[IEEE80211_AC_VI] = RTW_TX_QUEUE_VI,
+	[IEEE80211_AC_BE] = RTW_TX_QUEUE_BE,
+	[IEEE80211_AC_BK] = RTW_TX_QUEUE_BK,
+};
+
+static void rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
+			      struct rx_usb_ctrl_block *rxcb);
+static void rtw_usb_tx_agg(struct rtw_usb *rtwusb, struct sk_buff *skb);
+
+static void rtw_usb_fill_tx_checksum(struct rtw_usb *rtwusb,
+				     struct sk_buff *skb, int agg_num)
 {
 	struct rtw_dev *rtwdev = rtwusb->rtwdev;
 	struct rtw_chip_info *chip = rtwdev->chip;
@@ -38,7 +50,8 @@ static u8 rtw_usb_read8(struct rtw_dev *rtwdev, u32 addr)
 	mutex_lock(&rtwusb->usb_buf_mutex);
 	len = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_READ,
-			      addr, 0, &rtwusb->usb_buf.val8, sizeof(u8),
+			      addr, 0, &rtwusb->usb_buf.val8,
+			      sizeof(rtwusb->usb_buf.val8),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 	data = rtwusb->usb_buf.val8;
 	mutex_unlock(&rtwusb->usb_buf_mutex);
@@ -56,7 +69,8 @@ static u16 rtw_usb_read16(struct rtw_dev *rtwdev, u32 addr)
 	mutex_lock(&rtwusb->usb_buf_mutex);
 	len = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_READ,
-			      addr, 0, &rtwusb->usb_buf.val16, sizeof(u16),
+			      addr, 0, &rtwusb->usb_buf.val16,
+			      sizeof(rtwusb->usb_buf.val16),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 	data = le16_to_cpu(rtwusb->usb_buf.val16);
 	mutex_unlock(&rtwusb->usb_buf_mutex);
@@ -74,7 +88,8 @@ static u32 rtw_usb_read32(struct rtw_dev *rtwdev, u32 addr)
 	mutex_lock(&rtwusb->usb_buf_mutex);
 	len = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_READ,
-			      addr, 0, &rtwusb->usb_buf.val32, sizeof(u32),
+			      addr, 0, &rtwusb->usb_buf.val32,
+			      sizeof(rtwusb->usb_buf.val32),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 	data = le32_to_cpu(rtwusb->usb_buf.val32);
 	mutex_unlock(&rtwusb->usb_buf_mutex);
@@ -92,7 +107,8 @@ static void rtw_usb_write8(struct rtw_dev *rtwdev, u32 addr, u8 val)
 	rtwusb->usb_buf.val8 = val;
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_WRITE,
-			      addr, 0, &rtwusb->usb_buf.val8, sizeof(u8),
+			      addr, 0, &rtwusb->usb_buf.val8,
+			      sizeof(rtwusb->usb_buf.val8),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 
 	mutex_unlock(&rtwusb->usb_buf_mutex);
@@ -108,7 +124,8 @@ static void rtw_usb_write16(struct rtw_dev *rtwdev, u32 addr, u16 val)
 	rtwusb->usb_buf.val16 = cpu_to_le16(val);
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_WRITE,
-			      addr, 0, &rtwusb->usb_buf.val16, sizeof(u16),
+			      addr, 0, &rtwusb->usb_buf.val16,
+			      sizeof(rtwusb->usb_buf.val16),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 	mutex_unlock(&rtwusb->usb_buf_mutex);
 }
@@ -123,7 +140,8 @@ static void rtw_usb_write32(struct rtw_dev *rtwdev, u32 addr, u32 val)
 	rtwusb->usb_buf.val32 = cpu_to_le32(val);
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 			      RTW_USB_CMD_REQ, RTW_USB_CMD_WRITE,
-			      addr, 0, &rtwusb->usb_buf.val32, sizeof(u32),
+			      addr, 0, &rtwusb->usb_buf.val32,
+			      sizeof(rtwusb->usb_buf.val32),
 			      RTW_USB_CONTROL_MSG_TIMEOUT);
 	mutex_unlock(&rtwusb->usb_buf_mutex);
 }
@@ -214,29 +232,19 @@ exit:
 	return ret;
 }
 
-static
-bool rtw_usb_is_bus_ready(struct rtw_dev *rtwdev)
+static bool rtw_usb_is_bus_ready(struct rtw_dev *rtwdev)
 {
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
 
 	return (atomic_read(&rtwusb->is_bus_drv_ready) == true);
 }
 
-static
-void rtw_usb_set_bus_ready(struct rtw_dev *rtwdev, bool ready)
+static void rtw_usb_set_bus_ready(struct rtw_dev *rtwdev, bool ready)
 {
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
 
 	atomic_set(&rtwusb->is_bus_drv_ready, ready);
 }
-
-/* RTW queue / pipe functions */
-static u8 rtw_usb_ac_to_hwq[] = {
-	[IEEE80211_AC_VO] = RTW_TX_QUEUE_VO,
-	[IEEE80211_AC_VI] = RTW_TX_QUEUE_VI,
-	[IEEE80211_AC_BE] = RTW_TX_QUEUE_BE,
-	[IEEE80211_AC_BK] = RTW_TX_QUEUE_BK,
-};
 
 static u8 rtw_usb_tx_queue_mapping(struct sk_buff *skb)
 {
@@ -309,8 +317,8 @@ static void rtw_usb_three_outpipe_mapping(struct rtw_usb *rtwusb)
 	rtwusb->queue_to_pipe[RTW_TX_QUEUE_H2C] = rtwusb->out_ep[0];/* TXCMD */
 }
 
-static u8 rtw_usb_set_queue_pipe_mapping(struct rtw_dev *rtwdev, u8 in_pipes,
-					 u8 out_pipes)
+static void rtw_usb_set_queue_pipe_mapping(struct rtw_dev *rtwdev, u8 in_pipes,
+					   u8 out_pipes)
 {
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
 
@@ -355,10 +363,8 @@ static u8 rtw_usb_set_queue_pipe_mapping(struct rtw_dev *rtwdev, u8 in_pipes,
 		rtw_usb_one_outpipe_mapping(rtwusb);
 		break;
 	default:
-		return -1;
+		break;
 	}
-
-	return 0;
 }
 
 static void rtw_usb_interface_configure(struct rtw_dev *rtwdev)
@@ -419,7 +425,6 @@ static void rtw_usb_kill_handler(struct rtw_usb_handler *handler)
 	rtw_usb_set_event(&handler->event);
 }
 
-void rtw_usb_tx_func(struct rtw_usb *rtwusb);
 static void rtw_usb_tx_handler(struct work_struct *work)
 {
 	struct rtw_usb_work_data *work_data = container_of(work,
@@ -427,12 +432,21 @@ static void rtw_usb_tx_handler(struct work_struct *work)
 						       work);
 	struct rtw_dev *rtwdev = work_data->rtwdev;
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
+	struct sk_buff *skb;
+	int index;
 
 	do {
 		rtw_usb_wait_event(&rtwusb->tx_handler.event);
 		rtw_usb_reset_event(&rtwusb->tx_handler.event);
 
-		rtw_usb_tx_func(rtwusb);
+		index = RTK_MAX_TX_QUEUE_NUM - 1;
+		while (index >= 0) {
+			skb = skb_dequeue(&rtwusb->tx_queue[index]);
+			if (skb)
+				rtw_usb_tx_agg(rtwusb, skb);
+			else
+				index--;
+		}
 	} while (atomic_read(&rtwusb->tx_handler.handler_done) == 0);
 }
 
@@ -457,7 +471,7 @@ static void rtw_usb_write_port_direct_complete(struct urb *urb)
 	usb_free_urb(urb);
 }
 
-static u32 rtw_usb_write_port_direct(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
+static int rtw_usb_write_port_direct(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
 				     struct sk_buff *skb)
 {
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
@@ -482,7 +496,7 @@ static u32 rtw_usb_write_port_direct(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
 	return ret;
 }
 
-static u32 rtw_usb_write_port_wait(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
+static int rtw_usb_write_port_wait(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
 				   struct sk_buff *skb)
 {
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
@@ -501,7 +515,7 @@ static u32 rtw_usb_write_port_wait(struct rtw_dev *rtwdev, u8 addr, u32 cnt,
 	return ret;
 }
 
-static inline void rtw_usb_tx_queue_init(struct rtw_usb *rtwusb)
+static void rtw_usb_tx_queue_init(struct rtw_usb *rtwusb)
 {
 	int i;
 
@@ -511,7 +525,7 @@ static inline void rtw_usb_tx_queue_init(struct rtw_usb *rtwusb)
 	skb_queue_head_init(&rtwusb->tx_ack_queue);
 }
 
-static inline void rtw_usb_tx_queue_purge(struct rtw_usb *rtwusb)
+static void rtw_usb_tx_queue_purge(struct rtw_usb *rtwusb)
 {
 	int i;
 
@@ -521,30 +535,13 @@ static inline void rtw_usb_tx_queue_purge(struct rtw_usb *rtwusb)
 	skb_queue_purge(&rtwusb->tx_ack_queue);
 }
 
-static struct sk_buff *rtw_usb_tx_dequeue(struct rtw_usb *rtwusb)
-{
-	struct sk_buff *skb = NULL;
-	static int index = RTK_MAX_TX_QUEUE_NUM - 1;
-
-	for (; index >= 0; index--) {
-		skb = skb_dequeue(&rtwusb->tx_queue[index]);
-		if (skb)
-			break;
-	}
-
-	if (index < 0)
-		index = RTK_MAX_TX_QUEUE_NUM - 1;
-
-	return skb;
-}
-
-static inline void rtw_usb_tx_ack_enqueue(struct rtw_usb *rtwusb,
-					  struct sk_buff *skb)
+static void rtw_usb_tx_ack_enqueue(struct rtw_usb *rtwusb,
+				   struct sk_buff *skb)
 {
 	skb_queue_tail(&rtwusb->tx_ack_queue, skb);
 }
 
-static inline void rtw_usb_do_tx_ack_queue(struct rtw_usb *rtwusb)
+static void rtw_usb_do_tx_ack_queue(struct rtw_usb *rtwusb)
 {
 	struct rtw_dev *rtwdev = rtwusb->rtwdev;
 	struct sk_buff *skb;
@@ -562,59 +559,58 @@ static inline void rtw_usb_do_tx_ack_queue(struct rtw_usb *rtwusb)
 	}
 }
 
-static inline void rtw_usb_tx_agg(struct rtw_usb *rtwusb, struct sk_buff *skb)
+static void rtw_usb_tx_agg(struct rtw_usb *rtwusb, struct sk_buff *skb)
 {
 	struct rtw_dev *rtwdev = rtwusb->rtwdev;
 	struct sk_buff_head *list;
 	struct sk_buff *skb_head = NULL, *skb_iter;
 	unsigned long flags;
-	int status, len, agg_num = 0;
+	int status, len, max_len, agg_num = 0;
 	u8 *data_ptr, queue, qsel;
+	bool no_agg = false;
 
 	qsel = GET_TX_DESC_QSEL(skb->data);
 	queue = rtw_tx_qsel_to_queue(qsel);
 	if (queue != RTW_TX_QUEUE_VO)
-		goto err_no_need_agg;
+		no_agg = true;
 
 	list = &rtwusb->tx_queue[queue];
 	if (skb_queue_empty(list))
-		goto err_no_need_agg;
+		no_agg = true;
 
 	skb_head = dev_alloc_skb(RTW_USB_MAX_XMITBUF_SZ);
 	if (!skb_head)
-		goto err_no_need_agg;
+		no_agg = true;
 
-	data_ptr = skb_head->data;
-	skb_iter = skb;
-	while (skb_iter) {
-		memcpy(data_ptr, skb_iter->data, skb_iter->len);
-		len = ALIGN(skb_iter->len, 8);
-		skb_put(skb_head, len);
-		data_ptr += len;
-		agg_num++;
+	if (no_agg) {
+		skb_head = skb;
+		rtw_usb_tx_ack_enqueue(rtwusb, skb);
+	} else {
+		data_ptr = skb_head->data;
+		skb_iter = skb;
+		while (skb_iter) {
+			memcpy(data_ptr, skb_iter->data, skb_iter->len);
+			len = ALIGN(skb_iter->len, 8);
+			skb_put(skb_head, len);
+			data_ptr += len;
+			agg_num++;
 
-		rtw_usb_tx_ack_enqueue(rtwusb, skb_iter);
+			rtw_usb_tx_ack_enqueue(rtwusb, skb_iter);
 
-		spin_lock_irqsave(&list->lock, flags);
-		skb_iter = skb_peek(list);
-		if (skb_iter &&
-		    skb_iter->len < RTW_USB_MAX_XMITBUF_SZ - skb_head->len)
-			__skb_unlink(skb_iter, list);
-		else
-			skb_iter = NULL;
-		spin_unlock_irqrestore(&list->lock, flags);
-	};
+			spin_lock_irqsave(&list->lock, flags);
+			skb_iter = skb_peek(list);
+			max_len = RTW_USB_MAX_XMITBUF_SZ - skb_head->len;
+			if (skb_iter && skb_iter->len < max_len)
+				__skb_unlink(skb_iter, list);
+			else
+				skb_iter = NULL;
+			spin_unlock_irqrestore(&list->lock, flags);
+		}
 
-	if (agg_num > 1)
-		rtw_usb_fill_tx_checksum(rtwusb, skb_head, agg_num);
+		if (agg_num > 1)
+			rtw_usb_fill_tx_checksum(rtwusb, skb_head, agg_num);
+	}
 
-	goto write_port;
-
-err_no_need_agg:
-	skb_head = skb;
-	rtw_usb_tx_ack_enqueue(rtwusb, skb);
-
-write_port:
 	status = rtw_usb_write_port_wait(rtwdev, queue, skb_head->len,
 					 skb_head);
 	if (status)
@@ -626,34 +622,15 @@ write_port:
 	rtw_usb_do_tx_ack_queue(rtwusb);
 }
 
-void rtw_usb_tx_func(struct rtw_usb *rtwusb)
-{
-	struct sk_buff *skb;
-
-	while (1) {
-		mutex_lock(&rtwusb->tx_lock);
-
-		skb = rtw_usb_tx_dequeue(rtwusb);
-		if (!skb) {
-			mutex_unlock(&rtwusb->tx_lock);
-			break;
-		}
-
-		rtw_usb_tx_agg(rtwusb, skb);
-
-		mutex_unlock(&rtwusb->tx_lock);
-	}
-}
-
-static int
-rtw_usb_write_data(struct rtw_dev *rtwdev, struct rtw_tx_pkt_info *pkt_info,
-		   u8 *buf)
+static int rtw_usb_write_data(struct rtw_dev *rtwdev,
+			      struct rtw_tx_pkt_info *pkt_info,
+			      u8 *buf)
 {
 	struct rtw_chip_info *chip = rtwdev->chip;
 	struct sk_buff *skb;
-	u32 desclen, len, headsize, size;
+	unsigned int desclen, len, headsize, size;
 	u8 queue, qsel;
-	u8 ret = 0;
+	int ret = 0;
 
 	size = pkt_info->tx_pkt_size;
 	qsel = pkt_info->qsel;
@@ -667,7 +644,7 @@ rtw_usb_write_data(struct rtw_dev *rtwdev, struct rtw_tx_pkt_info *pkt_info,
 
 	skb_reserve(skb, headsize);
 
-	memcpy((u8 *)skb_put(skb, size), buf, size);
+	__skb_put_data(skb, buf, size);
 
 	skb_push(skb, headsize);
 	memset(skb->data, 0, headsize);
@@ -690,7 +667,7 @@ static int rtw_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf,
 {
 	struct rtw_chip_info *chip = rtwdev->chip;
 	struct rtw_usb *rtwusb;
-	struct rtw_tx_pkt_info pkt_info;
+	struct rtw_tx_pkt_info pkt_info = {0};
 	u32 len, desclen;
 	u8 qsel = TX_DESC_QSEL_BEACON;
 
@@ -701,7 +678,6 @@ static int rtw_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf,
 	if (unlikely(!rtwusb))
 		return -EINVAL;
 
-	memset(&pkt_info, 0, sizeof(pkt_info));
 	pkt_info.tx_pkt_size = size;
 	pkt_info.qsel = qsel;
 
@@ -720,10 +696,9 @@ static int rtw_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf,
 
 static int rtw_usb_write_data_h2c(struct rtw_dev *rtwdev, u8 *buf, u32 size)
 {
-	struct rtw_tx_pkt_info pkt_info;
+	struct rtw_tx_pkt_info pkt_info = {0};
 	u8 qsel = TX_DESC_QSEL_H2C;
 
-	memset(&pkt_info, 0, sizeof(pkt_info));
 	pkt_info.tx_pkt_size = size;
 	pkt_info.qsel = qsel;
 
@@ -764,9 +739,6 @@ static void rtw_usb_tx_kick_off(struct rtw_dev *rtwdev)
 	rtw_usb_set_event(&rtwusb->tx_handler.event);
 }
 
-static u32 rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
-			     struct rx_usb_ctrl_block *rxcb);
-
 static void rtw_usb_rx_handler(struct work_struct *work)
 {
 	struct rtw_usb_work_data *work_data = container_of(work,
@@ -780,16 +752,13 @@ static void rtw_usb_rx_handler(struct work_struct *work)
 		rtw_usb_wait_event(&rtwusb->rx_handler.event);
 		rtw_usb_reset_event(&rtwusb->rx_handler.event);
 
-		while (true) {
+		while (atomic_read(&rtwusb->rx_handler.handler_done) == 0) {
 			u8 *rx_desc;
 			struct rtw_chip_info *chip = rtwdev->chip;
 			struct ieee80211_rx_status rx_status;
 			struct rtw_rx_pkt_stat pkt_stat;
 			u32 pkt_desc_sz = chip->rx_pkt_desc_sz;
 			u32 pkt_offset;
-
-			if (atomic_read(&rtwusb->rx_handler.handler_done))
-				goto out;
 
 			skb = skb_dequeue(&rtwusb->rx_queue);
 			if (!skb)
@@ -823,7 +792,6 @@ static void rtw_usb_rx_handler(struct work_struct *work)
 		}
 	} while (atomic_read(&rtwusb->rx_handler.handler_done) == 0);
 
-out:
 	skb_queue_purge(&rtwusb->rx_queue);
 }
 
@@ -873,24 +841,23 @@ static void rtw_usb_read_port_complete(struct urb *urb)
 	}
 }
 
-static u32 rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
-			     struct rx_usb_ctrl_block *rxcb)
+static void rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
+			      struct rx_usb_ctrl_block *rxcb)
 {
-	unsigned int pipe;
-	int ret = -1;
 	struct urb *urb = NULL;
 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
 	struct usb_device *usbd = rtwusb->udev;
 	struct sk_buff *skb;
+	unsigned int pipe;
+	size_t alignment;
 	u32 len;
-	size_t buf_addr;
-	size_t alignment = 0;
+	int ret;
 
 	if (!rtw_usb_is_bus_ready(rtwdev))
-		return 0;
+		return;
 
 	urb = rxcb->rx_urb;
-	rxcb->data = (u8 *)rtwdev;
+	rxcb->data = (void *)rtwdev;
 
 	pipe = rtw_usb_get_pipe(rtwusb, RTW_USB_BULK_IN_ADDR);
 
@@ -898,10 +865,9 @@ static u32 rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
 	skb = dev_alloc_skb(len);
 	if (!skb) {
 		rtw_err(rtwdev, "dev_alloc_skb failed\n");
-		return -ENOMEM;
+		return;
 	}
-	buf_addr = (size_t)skb->data;
-	alignment = buf_addr & (RTW_USB_RECVBUFF_ALIGN_SZ - 1);
+	alignment = (size_t)skb->data & (RTW_USB_RECVBUFF_ALIGN_SZ - 1);
 	skb_reserve(skb, RTW_USB_RECVBUFF_ALIGN_SZ - alignment);
 
 	urb->transfer_buffer = skb->data;
@@ -916,8 +882,6 @@ static u32 rtw_usb_read_port(struct rtw_dev *rtwdev, u8 addr,
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	if (ret)
 		rtw_err(rtwdev, "usb_submit_urb failed, ret=%d\n", ret);
-
-	return ret;
 }
 
 static void rtw_usb_inirp_init(struct rtw_dev *rtwdev)
@@ -1022,7 +986,7 @@ static int rtw_usb_init_rx(struct rtw_dev *rtwdev)
 	rtwusb->rxwq = create_singlethread_workqueue("rtw88_usb: rx wq");
 	if (!rtwusb->rxwq) {
 		rtw_err(rtwdev, "create_singlethread_workqueue failed\n");
-		goto err;
+		return -ENOMEM;
 	}
 
 	skb_queue_head_init(&rtwusb->rx_queue);
@@ -1045,7 +1009,6 @@ err_destroy_wq:
 	rtw_usb_kill_handler(&rtwusb->rx_handler);
 	destroy_workqueue(rtwusb->rxwq);
 
-err:
 	return -ENOMEM;
 }
 
@@ -1117,7 +1080,6 @@ int rtw_usb_probe(struct usb_interface *intf,
 	rtwusb = rtw_get_usb_priv(rtwdev);
 	rtwusb->udev = udev;
 	rtwusb->rtwdev = rtwdev;
-	mutex_init(&rtwusb->tx_lock);
 
 	ret = rtw_usb_parse(rtwdev, intf);
 	if (ret) {
@@ -1168,7 +1130,6 @@ err_destroy_usb:
 err_deinit_core:
 	rtw_core_deinit(rtwdev);
 	mutex_destroy(&rtwusb->usb_buf_mutex);
-	mutex_destroy(&rtwusb->tx_lock);
 
 err_release_hw:
 	ieee80211_free_hw(hw);
@@ -1210,7 +1171,6 @@ void rtw_usb_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 	rtw_core_deinit(rtwdev);
 	mutex_destroy(&rtwusb->usb_buf_mutex);
-	mutex_destroy(&rtwusb->tx_lock);
 	ieee80211_free_hw(hw);
 }
 EXPORT_SYMBOL(rtw_usb_disconnect);

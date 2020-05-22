@@ -112,7 +112,6 @@ struct rtw_usb {
 
 	u8 usb_txagg_num;
 
-	struct mutex tx_lock; /* mutex for tx */
 	struct sk_buff_head tx_queue[RTK_MAX_TX_QUEUE_NUM];
 	struct sk_buff_head tx_ack_queue;
 	struct rtw_usb_handler tx_handler;
@@ -124,8 +123,7 @@ struct rtw_usb {
 	struct rtw_usb_work_data *rx_handler_data;
 };
 
-static inline struct
-rtw_usb_tx_data *rtw_usb_get_tx_data(struct sk_buff *skb)
+static inline struct rtw_usb_tx_data *rtw_usb_get_tx_data(struct sk_buff *skb)
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 
