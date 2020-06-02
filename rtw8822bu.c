@@ -7,14 +7,14 @@
 #include "rtw8822bu.h"
 
 static const struct usb_device_id rtw_8822bu_id_table[] = {
-	{ RTK_USB_DEVICE_AND_INTERFACE(RTW_USB_VENDOR_ID_REALTEK,
+	{ USB_DEVICE_AND_INTERFACE_INFO(RTW_USB_VENDOR_ID_REALTEK,
 				       RTW_USB_PRODUCT_ID_REALTEK_8812B,
-				       0xff, 0xff, 0xff,
-				       rtw8822b_hw_spec) },
-	{ RTK_USB_DEVICE_AND_INTERFACE(RTW_USB_VENDOR_ID_REALTEK,
+				       0xff, 0xff, 0xff),
+	  .driver_info = (kernel_ulong_t)&(rtw8822b_hw_spec) },
+	{ USB_DEVICE_AND_INTERFACE_INFO(RTW_USB_VENDOR_ID_REALTEK,
 				       RTW_USB_PRODUCT_ID_REALTEK_8822B,
-				       0xff, 0xff, 0xff,
-				       rtw8822b_hw_spec) },
+				       0xff, 0xff, 0xff),
+	  .driver_info = (kernel_ulong_t)&(rtw8822b_hw_spec) },
 	{},
 };
 MODULE_DEVICE_TABLE(usb, rtw_8822bu_id_table);

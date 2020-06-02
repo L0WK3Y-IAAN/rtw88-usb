@@ -179,7 +179,8 @@ u8 rtw_tx_qsel_to_queue(u8 qsel)
 	case TX_DESC_QSEL_TID2:
 		return RTW_TX_QUEUE_BK;
 	default:
-		return -1;
+		return RTW_TX_QUEUE_BCN;
 	}
 }
+
 #endif

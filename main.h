@@ -811,6 +811,12 @@ struct rtw_txq {
 	unsigned long last_push;
 };
 
+struct rtw_vif_cfgq {
+	struct list_head list;
+
+	struct rtw_vif *rtwvif;
+};
+
 #define RTW_BC_MC_MACID 1
 DECLARE_EWMA(rssi, 10, 16);
 
@@ -1846,6 +1852,8 @@ struct rtw_dev {
 	struct rtw_wow_param wow;
 
 	bool need_rfk;
+
+	struct list_head vif_cfgq;
 
 	/* hci related data, must be last */
 	u8 priv[] __aligned(sizeof(void *));
